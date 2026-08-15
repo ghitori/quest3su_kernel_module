@@ -1,0 +1,414 @@
+# Build KernelSU LKM for Oculus Quest 3 / Quest 3S.
+# ddk is a git submodule used as the module build tool.
+
+name: build-quest3su-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_repo:
+        description: 'KernelSU 仓库 owner/repo，默认 tiann/KernelSU，可填 SukiSU 等'
+        required: false
+        default: 'tiann/KernelSU'
+      kernelsu_ref:
+        description: 'KernelSU 版本 tag 或 commit SHA，留空取 latest release'
+        required: false
+        default: ''
+      device:
+        description: '设备代号'
+        required: false
+        default: 'eureka'
+        type: choice
+        options:
+          - eureka
+          - panther
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: facebookincubator/oculus-linux-kernel
+  CLANG_BRANCH: android14-release
+  CLANG_VERSION: clang-r450784e
+  GCC_BRANCH: android12-release
+
+concurrency:
+  group: build-kernelsu-oculus-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build kernelsu.ko
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    outputs:
+      ksu-ref: ${{ steps.ksu-ref.outputs.ref }}
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Resolve kernel source
+        id: kernel-src
+        run: |
+          set -euxo pipefail
+          case "${{ inputs.device }}" in
+            eureka)
+              BRANCH=oculus-quest3-kernel-master
+              COMMIT=bbb8e0cff7f048bdf011ab3e7fd686886879d80f
+              ;;
+            panther)
+              BRANCH=oculus-quest3s-kernel-master
+              COMMIT=9e9747b6f029257e023f507d3046e8dc537f6af9
+              ;;
+            *)
+              echo "::error::unsupported device: ${{ inputs.device }}" >&2
+              exit 1
+              ;;
+          esac
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "kernel source: ${{ env.KERNEL_REPO }} @ $BRANCH / $COMMIT"
+
+      - name: Checkout Oculus kernel
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ steps.kernel-src.outputs.commit }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl wget ccache bison flex bc cpio \
+            python3 python3-dev libssl-dev libncurses-dev libelf-dev \
+            lz4 zstd xz-utils zip unzip bzip2 lzop device-tree-compiler \
+            pkg-config m4 rsync dwarves jq
+          df -h
+
+      - name: Restore toolchain cache
+        id: toolchain-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: toolchain
+          key: toolchain-${{ env.CLANG_VERSION }}-${{ env.GCC_BRANCH }}-v1
+
+      - name: Download clang
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}"
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.CLANG_BRANCH }}/${{ env.CLANG_VERSION }}.tar.gz" \
+            | tar -xz -C "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}"
+          "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/clang" --version | head -n 1
+
+      - name: Download aarch64 GCC 4.9
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9"
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/${{ env.GCC_BRANCH }}.tar.gz" \
+            | tar -xz -C "$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9"
+          ls "$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9/bin" | head -n 5
+
+      - name: Download arm32 GCC 4.9
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchain/arm-linux-androideabi-4.9"
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/heads/${{ env.GCC_BRANCH }}.tar.gz" \
+            | tar -xz -C "$GITHUB_WORKSPACE/toolchain/arm-linux-androideabi-4.9"
+          ls "$GITHUB_WORKSPACE/toolchain/arm-linux-androideabi-4.9/bin" | head -n 5
+
+      - name: Add toolchains to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchain/arm-linux-androideabi-4.9/bin" >> "$GITHUB_PATH"
+
+      - name: Save toolchain cache
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: toolchain
+          key: toolchain-${{ env.CLANG_VERSION }}-${{ env.GCC_BRANCH }}-v1
+
+      - name: Create clang-ccache wrapper
+        run: |
+          set -euxo pipefail
+          CLANG="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/clang"
+          WRAP="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/clang-ccache"
+          cat > "$WRAP" <<EOF
+          #!/usr/bin/env bash
+          exec ccache $CLANG "\$@"
+          EOF
+          chmod +x "$WRAP"
+          "$WRAP" --version | head -n 1
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ inputs.device }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.device }}-
+
+      - name: Prepare kernel build environment
+        run: |
+          CLANG="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}"
+          GCC="$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9"
+          KCFLAGS="-Wno-frame-larger-than"
+          echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=4G" >> "$GITHUB_ENV"
+          echo "KCFLAGS=$KCFLAGS" >> "$GITHUB_ENV"
+          cat >> "$GITHUB_ENV" <<EOF
+          MAKE_ENV=O=$GITHUB_WORKSPACE/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- REAL_CC=$CLANG/bin/clang-ccache GCC_TOOLCHAIN=$GCC GCC_TOOLCHAIN_DIR=$GCC/bin LLVM=1 LLVM_IAS=1 LD=$CLANG/bin/ld.lld AR=$CLANG/bin/llvm-ar LLVM_AR=$CLANG/bin/llvm-ar NM=$CLANG/bin/llvm-nm LLVM_NM=$CLANG/bin/llvm-nm OBJCOPY=$CLANG/bin/llvm-objcopy OBJDUMP=$CLANG/bin/llvm-objdump READELF=$CLANG/bin/llvm-readelf OBJSIZE=$CLANG/bin/llvm-size STRIP=$CLANG/bin/llvm-strip HOSTCC=$CLANG/bin/clang HOSTAR=$CLANG/bin/llvm-ar HOSTLD=$CLANG/bin/ld.lld HOSTLDFLAGS=-fuse-ld=lld KCFLAGS=$KCFLAGS
+          EOF
+
+      - name: Merge oculus defconfigs
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          scripts/kconfig/merge_config.sh \
+            -O "$GITHUB_WORKSPACE/out" -m \
+            arch/arm64/configs/vendor/oculus_anorak_defconfig \
+            arch/arm64/configs/vendor/oculus_${{ inputs.device }}_defconfig
+          cp "$GITHUB_WORKSPACE/out/.config" "arch/arm64/configs/${{ inputs.device }}_defconfig"
+
+      - name: Configure kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          make $MAKE_ENV ${{ inputs.device }}_defconfig
+          # runner 内存有限，关闭完整 LTO；LTO 不影响 vermagic 与符号 CRC
+          scripts/config --file "$GITHUB_WORKSPACE/out/.config" \
+            -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          make $MAKE_ENV olddefconfig
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          make $MAKE_ENV -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log" | tail -n 100
+          ls -lh "$GITHUB_WORKSPACE/out"/vmlinux "$GITHUB_WORKSPACE/out"/System.map "$GITHUB_WORKSPACE/out"/Module.symvers
+          ccache -s | grep -E "Hits|Misses" || true
+
+      - name: Upload kernel build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-build-log-${{ inputs.device }}
+          path: kernel-build.log
+          if-no-files-found: ignore
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ inputs.device }}-${{ github.run_id }}
+
+      - name: Set up DDK local mode
+        run: |
+          set -euxo pipefail
+          bash scripts/setup-ddk-local.sh \
+            "$GITHUB_WORKSPACE/out" \
+            "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}" \
+            "$GITHUB_WORKSPACE/ddk"
+
+      - name: Resolve KernelSU ref
+        id: ksu-ref
+        run: |
+          set -euxo pipefail
+          if [ -z "${{ inputs.kernelsu_ref }}" ]; then
+            REF=$(curl -fsSL "https://api.github.com/repos/${{ inputs.kernelsu_repo }}/releases/latest" | jq -r .tag_name)
+          else
+            REF="${{ inputs.kernelsu_ref }}"
+          fi
+          echo "Using KernelSU repo/ref: ${{ inputs.kernelsu_repo }} @ $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout KernelSU
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.kernelsu_repo }}
+          ref: ${{ steps.ksu-ref.outputs.ref }}
+          path: kernelsu
+          fetch-depth: 0
+
+      - name: Build kernelsu.ko via ddk
+        run: |
+          set -euxo pipefail
+          MDIR="$GITHUB_WORKSPACE/kernelsu/kernel"
+          cd "$MDIR"
+          "$GITHUB_WORKSPACE/ddk/scripts/ddk" build android13-5.10 -- \
+            -C /opt/ddk/kdir/android13-5.10 \
+            M="$MDIR" \
+            modules \
+            CONFIG_KSU=m KBUILD_MODPOST_WARN=1 \
+            REAL_CC="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/clang" \
+            -j"$(nproc)"
+          ls -lh "$MDIR/kernelsu.ko"
+
+      - name: Verify kernelsu.ko
+        run: |
+          set -euxo pipefail
+          KDIR="$GITHUB_WORKSPACE/out"
+          KO="$GITHUB_WORKSPACE/kernelsu/kernel/kernelsu.ko"
+          READELF="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/llvm-readelf"
+          REL=$(cat "$KDIR/include/config/kernel.release")
+          echo "kernel release: $REL"
+          "$READELF" -p .modinfo "$KO" | grep -q "vermagic=$REL" || {
+            echo "::error::vermagic mismatch, expected $REL"
+            exit 1
+          }
+          "$READELF" -sW "$KO" | awk '$7=="UND" && $8!="" {print $8}' | sort -u > "$RUNNER_TEMP/undef.txt"
+          awk '{print $3}' "$KDIR/System.map" | sort -u > "$RUNNER_TEMP/sysmap.txt"
+          comm -23 "$RUNNER_TEMP/undef.txt" "$RUNNER_TEMP/sysmap.txt" > "$RUNNER_TEMP/missing.txt"
+          if [ -s "$RUNNER_TEMP/missing.txt" ]; then
+            echo "::error::symbols not found in kernel System.map:"
+            cat "$RUNNER_TEMP/missing.txt"
+            exit 1
+          fi
+          echo "OK: all $(wc -l < "$RUNNER_TEMP/undef.txt") undefined symbols exist in kernel"
+          grep vermagic <("$READELF" -p .modinfo "$KO")
+
+      - name: Strip and stage artifact
+        run: |
+          set -euxo pipefail
+          KO="$GITHUB_WORKSPACE/kernelsu/kernel/kernelsu.ko"
+          "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/llvm-strip" -d "$KO"
+          cp "$KO" "$GITHUB_WORKSPACE/quest3su.ko"
+          ls -lh "$GITHUB_WORKSPACE/quest3su.ko"
+
+      - name: Upload kernelsu.ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernelsu.ko-${{ inputs.device }}
+          path: quest3su.ko
+          if-no-files-found: error
+
+  build-ksud:
+    name: Build ksud
+    runs-on: ubuntu-22.04
+    needs: build
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout KernelSU
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.kernelsu_repo }}
+          ref: ${{ needs.build.outputs.ksu-ref }}
+          path: kernelsu
+          fetch-depth: 0
+
+      - name: Download kernelsu.ko
+        uses: actions/download-artifact@v8
+        with:
+          name: kernelsu.ko-${{ inputs.device }}
+          path: kernelsu-ko
+
+      - name: Embed kernelsu.ko into ksud assets
+        run: |
+          set -euxo pipefail
+          KO=$(find kernelsu-ko -name 'quest3su.ko' | head -n 1)
+          test -n "$KO"
+          # KMI 名统一为 quest3su，ksud 按 <kmi>_kernelsu.ko 查找
+          find kernelsu/userspace/ksud/bin -name '*_kernelsu.ko' -delete
+          cp "$KO" "kernelsu/userspace/ksud/bin/aarch64/quest3su_kernelsu.ko"
+          ls -lh "kernelsu/userspace/ksud/bin/aarch64/"
+
+      - name: Setup rust toolchain
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kernelsu/userspace/ksud
+          cache-targets: false
+
+      - name: Setup Android NDK r29
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euxo pipefail
+          cd kernelsu
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target aarch64-linux-android --release --manifest-path userspace/ksud/Cargo.toml
+
+      - name: Verify embedded kernelsu.ko
+        run: |
+          set -euxo pipefail
+          KSUD=kernelsu/target/aarch64-linux-android/release/ksud
+          test -f "$KSUD"
+          strings "$KSUD" | grep -q "quest3su_kernelsu.ko" || {
+            echo "::error::quest3su_kernelsu.ko not embedded in ksud"
+            exit 1
+          }
+
+      - name: Upload ksud artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ inputs.device }}
+          path: kernelsu/target/aarch64-linux-android/release/ksud
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-22.04
+    needs: [build, build-ksud]
+
+    steps:
+      - name: Download quest3su.ko
+        uses: actions/download-artifact@v8
+        with:
+          name: kernelsu.ko-${{ inputs.device }}
+          path: release/ko
+
+      - name: Download ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-${{ inputs.device }}
+          path: release/ksud
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          REPO_NAME="${{ inputs.kernelsu_repo }}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REF="${{ needs.build.outputs.ksu-ref }}"
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            REF="${REF:0:12}"
+          fi
+          DEVICE="${{ inputs.device }}"
+          TAG="${REPO_NAME}-${REF}-${DEVICE}"
+          KO=$(find release/ko -name quest3su.ko | head -n 1)
+          KSUD=$(find release/ksud -type f | head -n 1)
+          test -n "$KO" && test -n "$KSUD"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$KO" "$KSUD" --clobber
+          else
+            gh release create "$TAG" "$KO" "$KSUD" --title "$TAG"
+          fi

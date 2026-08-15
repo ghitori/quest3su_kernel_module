@@ -1,0 +1,4 @@
+/out/
+/toolchain/
+*.log
+kernelsu-*.ko
