@@ -280,10 +280,20 @@ jobs:
         id: ksu-ref
         run: |
           set -euxo pipefail
-          if [ -z "${{ inputs.kernelsu_ref }}" ]; then
-            REF=$(curl -fsSL "https://api.github.com/repos/${{ inputs.kernelsu_repo }}/releases/latest" | jq -r .tag_name)
-          else
-            REF="${{ inputs.kernelsu_ref }}"
+          REF="${{ inputs.kernelsu_ref }}"
+          if [ -z "$REF" ]; then
+            API="https://api.github.com/repos/${{ inputs.kernelsu_repo }}"
+            REF=$(curl -fsSL "$API/releases" | jq -r '[.[] | select(.prerelease == false and .draft == false)][0].tag_name // empty')
+            if [ -z "$REF" ]; then
+              REF=$(curl -fsSL "$API/releases" | jq -r '[.[] | select(.draft == false)][0].tag_name // empty')
+            fi
+            if [ -z "$REF" ]; then
+              REF=$(curl -fsSL "$API/tags" | jq -r '.[0].name // empty')
+            fi
+            if [ -z "$REF" ]; then
+              BRANCH=$(curl -fsSL "$API" | jq -r '.default_branch')
+              REF=$(curl -fsSL "$API/commits/$BRANCH" | jq -r '.sha')
+            fi
           fi
           echo "Using KernelSU repo/ref: ${{ inputs.kernelsu_repo }} @ $REF"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
