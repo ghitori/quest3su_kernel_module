@@ -407,8 +407,8 @@ jobs:
           KO=$(find release/ko -name quest3su.ko | head -n 1)
           KSUD=$(find release/ksud -type f | head -n 1)
           test -n "$KO" && test -n "$KSUD"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$KO" "$KSUD" --clobber
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$KO" "$KSUD" --repo "${{ github.repository }}" --clobber
           else
-            gh release create "$TAG" "$KO" "$KSUD" --title "$TAG"
+            gh release create "$TAG" "$KO" "$KSUD" --repo "${{ github.repository }}" --title "$TAG"
           fi
