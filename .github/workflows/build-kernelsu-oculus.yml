@@ -182,7 +182,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ inputs.device }}-${{ github.run_id }}
+          key: ccache-${{ inputs.device }}-${{ env.CLANG_VERSION }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ inputs.device }}-
 
@@ -262,10 +262,11 @@ jobs:
 
       - name: Save ccache
         if: always() && steps.kernel-tree-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-${{ inputs.device }}-${{ github.run_id }}
+          key: ccache-${{ inputs.device }}-${{ env.CLANG_VERSION }}-${{ github.sha }}
 
       - name: Set up DDK local mode
         run: |
