@@ -72,13 +72,36 @@ jobs:
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
           echo "kernel source: ${{ env.KERNEL_REPO }} @ $BRANCH / $COMMIT"
 
+      - name: Restore kernel source cache
+        id: kernel-src-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: kernel
+          key: kernel-src-${{ steps.kernel-src.outputs.commit }}
+
       - name: Checkout Oculus kernel
+        if: steps.kernel-src-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v7
         with:
           repository: ${{ env.KERNEL_REPO }}
           ref: ${{ steps.kernel-src.outputs.commit }}
           path: kernel
           fetch-depth: 1
+
+      - name: Save kernel source cache
+        if: steps.kernel-src-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: kernel
+          key: kernel-src-${{ steps.kernel-src.outputs.commit }}
+
+      - name: Restore kernel tree cache
+        id: kernel-tree-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: out
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}
 
       - name: Install build dependencies
         run: |
@@ -155,6 +178,7 @@ jobs:
           "$WRAP" --version | head -n 1
 
       - name: Restore ccache
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/ccache
@@ -163,6 +187,7 @@ jobs:
             ccache-${{ inputs.device }}-
 
       - name: Prepare kernel build environment
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           CLANG="$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}"
           GCC="$GITHUB_WORKSPACE/toolchain/aarch64-linux-android-4.9"
@@ -175,6 +200,7 @@ jobs:
           EOF
 
       - name: Merge oculus defconfigs
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
@@ -186,6 +212,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/out/.config" "arch/arm64/configs/${{ inputs.device }}_defconfig"
 
       - name: Configure kernel
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
@@ -196,6 +223,7 @@ jobs:
           make $MAKE_ENV olddefconfig
 
       - name: Build kernel
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
@@ -203,8 +231,28 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/out"/vmlinux "$GITHUB_WORKSPACE/out"/System.map "$GITHUB_WORKSPACE/out"/Module.symvers
           ccache -s | grep -E "Hits|Misses" || true
 
+      - name: Prune kernel tree for cache
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/out"
+          find . -name '*.o' -delete
+          find . -name '*.cmd' -delete
+          find . -name '*.ko' -delete
+          find . -type d -name '.tmp_*' -exec rm -rf {} + 2>/dev/null || true
+          "$GITHUB_WORKSPACE/toolchain/${{ env.CLANG_VERSION }}/bin/llvm-strip" -g vmlinux 2>/dev/null || true
+          du -sh .
+
+      - name: Save kernel tree cache
+        if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: out
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}
+
       - name: Upload kernel build log
-        if: always()
+        if: always() && steps.kernel-tree-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
@@ -213,7 +261,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save ccache
-        if: always()
+        if: always() && steps.kernel-tree-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ccache
@@ -346,10 +394,28 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r29
+          local-cache: true
+
+      - name: Install sccache
+        run: |
+          curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.17.0/sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin --strip-components=1 \
+              sccache-v0.17.0-x86_64-unknown-linux-musl/sccache
+          sccache --version
+
+      - name: Restore sccache
+        id: sccache-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/sccache
+          key: sccache-${{ github.run_id }}
+          restore-keys: sccache-
 
       - name: Build ksud
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: 2G
         run: |
           set -euxo pipefail
           cd kernelsu
@@ -365,6 +431,19 @@ jobs:
             echo "::error::quest3su_kernelsu.ko not embedded in ksud"
             exit 1
           }
+
+      - name: Flush sccache
+        if: always()
+        continue-on-error: true
+        run: sccache --stop-server || true
+
+      - name: Save sccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/sccache
+          key: sccache-${{ github.run_id }}
 
       - name: Upload ksud artifact
         uses: actions/upload-artifact@v7
