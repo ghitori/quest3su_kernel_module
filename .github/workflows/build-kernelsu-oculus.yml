@@ -390,12 +390,30 @@ jobs:
           workspaces: kernelsu/userspace/ksud
           cache-targets: false
 
-      - name: Setup Android NDK r29
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
+      - name: Restore NDK cache
+        id: ndk-cache
+        uses: actions/cache/restore@v6
         with:
-          ndk-version: r29
-          local-cache: true
+          path: ndk
+          key: ndk-r29
+
+      - name: Download NDK r29
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o /tmp/android-ndk-r29-linux.zip \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q /tmp/android-ndk-r29-linux.zip -d /tmp
+          mv /tmp/android-ndk-r29 "$GITHUB_WORKSPACE/ndk"
+          rm -f /tmp/android-ndk-r29-linux.zip
+
+      - name: Save NDK cache
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ndk
+          key: ndk-r29
 
       - name: Install sccache
         run: |
@@ -414,7 +432,7 @@ jobs:
 
       - name: Build ksud
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ github.workspace }}/ndk
           RUSTC_WRAPPER: sccache
           SCCACHE_CACHE_SIZE: 2G
         run: |
