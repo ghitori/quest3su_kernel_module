@@ -225,17 +225,22 @@ jobs:
       - name: Add swap (zram preferred, swapfile fallback)
         run: |
           set -euxo pipefail
-          # zram: RAM-backed compressed swap, does not consume the 14G runner disk
+          free -h
+          # 注意：标准 runner 镜像已自带一个 swapon 的 /swapfile，
+          # 对它做写打开会得到 ETXTBSY (Text file busy)，所以追加时用独立文件名。
           if sudo modprobe zram 2>/dev/null; then
+            # zram: RAM-backed compressed swap, does not consume the 14G runner disk
             echo 6G | sudo tee /sys/block/zram0/disksize >/dev/null
             sudo mkswap /dev/zram0 >/dev/null
             sudo swapon /dev/zram0
           else
-            # fallback: small swapfile, keep it modest due to limited disk
-            sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile >/dev/null
-            sudo swapon /swapfile
+            # fallback: add capacity via a separate swapfile, keep it modest (disk is limited)
+            SWAPFILE=/mnt/swapfile-ci
+            sudo rm -f "$SWAPFILE" 2>/dev/null || true
+            sudo fallocate -l 2G "$SWAPFILE" 2>/dev/null || sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none
+            sudo chmod 600 "$SWAPFILE"
+            sudo mkswap "$SWAPFILE" >/dev/null
+            sudo swapon "$SWAPFILE"
           fi
           free -h
 
