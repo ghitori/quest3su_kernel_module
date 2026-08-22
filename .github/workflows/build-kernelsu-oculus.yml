@@ -252,7 +252,7 @@ jobs:
           key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto
 
       - name: Upload kernel build log
-        if: always() && steps.kernel-tree-cache.outputs.cache-hit != 'true'
+        if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
