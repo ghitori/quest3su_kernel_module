@@ -32,10 +32,6 @@ env:
   CLANG_VERSION: clang-r450784e
   GCC_BRANCH: android12-release
 
-concurrency:
-  group: build-kernelsu-oculus-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Build kernelsu.ko
