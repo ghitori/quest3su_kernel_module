@@ -101,7 +101,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: out
-          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto
 
       - name: Install build dependencies
         run: |
@@ -217,9 +217,9 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
           make $MAKE_ENV ${{ inputs.device }}_defconfig
-          # runner 内存有限，关闭完整 LTO；LTO 不影响 vermagic 与符号 CRC
-          scripts/config --file "$GITHUB_WORKSPACE/out/.config" \
-            -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          # 保持设备出货内核配置（LTO_CLANG_FULL + CFI_CLANG），
+          # 关闭 LTO 会连带关闭 CFI，导致 module_layout 等符号 CRC 与设备内核不一致，
+          # init_module 报 "disagrees about version of symbol module_layout" (ENOEXEC)。
           make $MAKE_ENV olddefconfig
 
       - name: Build kernel
@@ -249,7 +249,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: out
-          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto
 
       - name: Upload kernel build log
         if: always() && steps.kernel-tree-cache.outputs.cache-hit != 'true'
