@@ -222,35 +222,13 @@ jobs:
             -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_BTF
           make $MAKE_ENV olddefconfig
 
-      - name: Add swap (zram preferred, swapfile fallback)
-        run: |
-          set -euxo pipefail
-          free -h
-          # 注意：标准 runner 镜像已自带一个 swapon 的 /swapfile，
-          # 对它做写打开会得到 ETXTBSY (Text file busy)，所以追加时用独立文件名。
-          if sudo modprobe zram 2>/dev/null; then
-            # zram: RAM-backed compressed swap, does not consume the 14G runner disk
-            echo 6G | sudo tee /sys/block/zram0/disksize >/dev/null
-            sudo mkswap /dev/zram0 >/dev/null
-            sudo swapon /dev/zram0
-          else
-            # fallback: add capacity via a separate swapfile, keep it modest (disk is limited)
-            SWAPFILE=/mnt/swapfile-ci
-            sudo rm -f "$SWAPFILE" 2>/dev/null || true
-            sudo fallocate -l 2G "$SWAPFILE" 2>/dev/null || sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none
-            sudo chmod 600 "$SWAPFILE"
-            sudo mkswap "$SWAPFILE" >/dev/null
-            sudo swapon "$SWAPFILE"
-          fi
-          free -h
 
       - name: Build kernel
         if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
-          # full LTO + CFI 构建内存峰值高，串行编译 (-j1) 防止 OOM
-          make $MAKE_ENV -j1 2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log" | tail -n 100
+          make $MAKE_ENV -j$(nproc) 2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log"
           ls -lh "$GITHUB_WORKSPACE/out"/vmlinux "$GITHUB_WORKSPACE/out"/System.map "$GITHUB_WORKSPACE/out"/Module.symvers
           ccache -s | grep -E "Hits|Misses" || true
 
