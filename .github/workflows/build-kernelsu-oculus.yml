@@ -101,7 +101,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: out
-          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto-nodbg
 
       - name: Install build dependencies
         run: |
@@ -220,14 +220,36 @@ jobs:
           # 保持设备出货内核配置（LTO_CLANG_FULL + CFI_CLANG），
           # 关闭 LTO 会连带关闭 CFI，导致 module_layout 等符号 CRC 与设备内核不一致，
           # init_module 报 "disagrees about version of symbol module_layout" (ENOEXEC)。
+          # CI 内存有限：关闭 debug 信息/BTF，消除 pahole 的内存尖峰。
+          # 不影响符号 CRC（genksyms 只依赖类型签名，struct module 无 BTF 字段）。
+          scripts/config --file "$GITHUB_WORKSPACE/out/.config" \
+            -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_BTF
           make $MAKE_ENV olddefconfig
+
+      - name: Add swap (zram preferred, swapfile fallback)
+        run: |
+          set -euxo pipefail
+          # zram: RAM-backed compressed swap, does not consume the 14G runner disk
+          if sudo modprobe zram 2>/dev/null; then
+            echo 6G | sudo tee /sys/block/zram0/disksize >/dev/null
+            sudo mkswap /dev/zram0 >/dev/null
+            sudo swapon /dev/zram0
+          else
+            # fallback: small swapfile, keep it modest due to limited disk
+            sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null
+            sudo swapon /swapfile
+          fi
+          free -h
 
       - name: Build kernel
         if: steps.kernel-tree-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
-          make $MAKE_ENV -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log" | tail -n 100
+          # full LTO + CFI 构建内存峰值高，串行编译 (-j1) 防止 OOM
+          make $MAKE_ENV -j1 2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log" | tail -n 100
           ls -lh "$GITHUB_WORKSPACE/out"/vmlinux "$GITHUB_WORKSPACE/out"/System.map "$GITHUB_WORKSPACE/out"/Module.symvers
           ccache -s | grep -E "Hits|Misses" || true
 
@@ -249,7 +271,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: out
-          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto
+          key: kernel-tree-${{ inputs.device }}-${{ steps.kernel-src.outputs.commit }}-${{ env.CLANG_VERSION }}-full-lto-nodbg
 
       - name: Upload kernel build log
         if: always()
